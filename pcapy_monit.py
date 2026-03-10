@@ -119,7 +119,7 @@ def print_metrics_loop():
             print(f"ICMP Unreachable : {metrics['icmp_unreachable']}")
             print(f"ICMP TTL Exceeded: {metrics['icmp_ttl_exceeded']}")
             print(f"TCP RST          : {metrics['tcp_rst']}")
-            print(f"DNS NOERROR      : {metrics['dns_noerror']}")
+            #print(f"DNS NOERROR      : {metrics['dns_noerror']}")
             print(f"DNS NXDOMAIN     : {metrics['dns_nxdomain']}")
             print("-------------------------------")
             # reset counters for next interval
