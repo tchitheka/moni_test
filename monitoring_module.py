@@ -4,55 +4,43 @@ import threading
 import pcapy
 import struct
 import socket
+from collections import defaultdict, deque
 
 from prometheus_client import start_http_server, Gauge, Counter, Histogram
 
 # =============================
 # Prometheus Metrics
 # =============================
-internet_status = Gauge(
-    'internet_connectivity_status',
-    'Internet connectivity (1=UP, 0=DOWN)'
-)
+internet_status = Gauge('internet_connectivity_status','Internet connectivity (1=UP, 0=DOWN)')
+internet_latency = Gauge('internet_check_latency_seconds','Latency to reach google.com')
 
-# ❌ OLD (kept if you still want it)
-internet_latency = Gauge(
-    'internet_check_latency_seconds',
-    'Latency to reach google.com'
-)
-
-# ✅ NEW: Histogram for tail latency
 internet_rtt_seconds = Histogram(
     'internet_rtt_seconds',
     'RTT latency across multiple targets',
-    buckets=(0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5)
+    buckets = [
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.35,
+    0.4,
+    0.45,
+    0.5,
+    0.75,
+    1.0,
+    2.0
+]
 )
 
-# ✅ NEW: RTT failures
-rtt_failures_total = Counter(
-    'rtt_failures_total',
-    'Total number of RTT measurement failures'
-)
+rtt_failures_total = Counter('rtt_failures_total','Total RTT failures')
 
-lan_devices_total = Gauge(
-    'lan_devices_total',
-    'Active LAN devices based on ARP observation'
-)
+lan_devices_total = Gauge('lan_devices_total','Active LAN devices')
+device_flaps_total = Counter('device_flaps_total','Device flap events')
 
-device_flaps_total = Counter(
-    'device_flaps_total',
-    'Total number of device flap events'
-)
-
-dns_errors_total = Counter(
-    'dns_errors_total',
-    'Total number of DNS NXDOMAIN errors observed'
-)
-
-dns_success_total = Counter(
-    'dns_success_total',
-    'Total number of successful DNS responses observed'
-)
+dns_errors_total = Counter('dns_errors_total','DNS NXDOMAIN errors')
+dns_success_total = Counter('dns_success_total','DNS successful responses')
 
 # =============================
 # Config
@@ -61,17 +49,18 @@ CHECK_INTERVAL = 10
 ARP_CAPTURE_DURATION = 10
 DEVICE_TIMEOUT = 60
 FLAP_WINDOW = 120
-
 INTERFACE = "wlp0s20f3"
 
-# ✅ Multi-destination targets
-TARGETS = [
+# ✅ Static baseline targets (always included)
+STATIC_TARGETS = [
     ("8.8.8.8", 53),
     ("1.1.1.1", 53),
-    ("9.9.9.9", 53),
-    ("google.com", 443),
-    ("cloudflare.com", 443),
 ]
+
+# Dynamic config
+TOP_N = 5
+DOMAIN_WINDOW = 300  # 5 minutes
+UPDATE_INTERVAL = 300
 
 # =============================
 # Global State
@@ -79,8 +68,15 @@ TARGETS = [
 device_last_seen = {}
 device_last_disappeared = {}
 
+# DNS tracking
+domain_counts = defaultdict(int)
+domain_timestamps = deque()
+dynamic_targets = []
+
+lock = threading.Lock()
+
 # =============================
-# RTT Measurement (TCP)
+# RTT Functions
 # =============================
 def tcp_rtt(host, port):
     start = time.time()
@@ -88,35 +84,28 @@ def tcp_rtt(host, port):
         sock = socket.create_connection((host, port), timeout=2)
         sock.close()
         return time.time() - start
-    except Exception:
+    except:
         return None
 
-# =============================
-# Parallel RTT Worker
-# =============================
 def probe_target(host, port):
     rtt = tcp_rtt(host, port)
 
     if rtt is not None:
         internet_rtt_seconds.observe(rtt)
-        print(f"[RTT] {host}:{port} = {rtt:.4f}s")
     else:
         rtt_failures_total.inc()
-        print(f"[RTT FAIL] {host}:{port}")
 
-# =============================
-# RTT Monitor (parallel probing)
-# =============================
 def latency_monitor():
     while True:
-        threads = []
+        with lock:
+            targets = STATIC_TARGETS + dynamic_targets
 
-        for host, port in TARGETS:
+        threads = []
+        for host, port in targets:
             t = threading.Thread(target=probe_target, args=(host, port))
             t.start()
             threads.append(t)
 
-        # wait for all probes to finish
         for t in threads:
             t.join()
 
@@ -127,35 +116,22 @@ def latency_monitor():
 # =============================
 def check_internet():
     start_time = time.time()
-
     try:
         result = subprocess.run(
-            [
-                "wget",
-                "-q",
-                "--spider",
-                "--server-response",
-                "https://www.google.com"
-            ],
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            timeout=5
+            ["wget","-q","--spider","--server-response","https://www.google.com"],
+            stderr=subprocess.PIPE, timeout=5
         )
 
         latency = time.time() - start_time
         internet_latency.set(latency)
 
-        if "200 OK" in result.stderr.decode():
-            return 1
-        else:
-            return 0
-
-    except Exception:
+        return 1 if "200 OK" in result.stderr.decode() else 0
+    except:
         internet_latency.set(0)
         return 0
 
 # =============================
-# ARP Discovery + Flap Detection
+# ARP Monitoring
 # =============================
 def discover_lan_devices():
     global device_last_seen, device_last_disappeared
@@ -163,65 +139,60 @@ def discover_lan_devices():
     try:
         cap = pcapy.open_live(INTERFACE, 65536, 1, 100)
         cap.setfilter("arp")
-    except Exception as e:
-        print(f"Error opening interface {INTERFACE}: {e}")
+    except:
         return 0
 
     start_time = time.time()
 
     while time.time() - start_time < ARP_CAPTURE_DURATION:
         try:
-            header, packet = cap.next()
+            _, packet = cap.next()
             if not packet:
                 continue
 
-            arp_header = packet[14:42]
-            arp = struct.unpack("!HHBBH6s4s6s4s", arp_header)
-
-            src_mac = ':'.join('%02x' % b for b in arp[5])
+            arp = struct.unpack("!HHBBH6s4s6s4s", packet[14:42])
+            mac = ':'.join('%02x' % b for b in arp[5])
             now = time.time()
 
-            if src_mac in device_last_disappeared:
-                if now - device_last_disappeared[src_mac] <= FLAP_WINDOW:
+            if mac in device_last_disappeared:
+                if now - device_last_disappeared[mac] <= FLAP_WINDOW:
                     device_flaps_total.inc()
-                    print(f"[FLAP DETECTED] {src_mac}")
+                del device_last_disappeared[mac]
 
-                del device_last_disappeared[src_mac]
+            device_last_seen[mac] = now
 
-            device_last_seen[src_mac] = now
-
-        except Exception:
+        except:
             continue
 
     now = time.time()
-    active_devices = {}
+    active = {}
 
     for mac, ts in device_last_seen.items():
         if now - ts <= DEVICE_TIMEOUT:
-            active_devices[mac] = ts
+            active[mac] = ts
         else:
             device_last_disappeared[mac] = now
 
-    device_last_seen = active_devices
-
-    return len(active_devices)
+    device_last_seen = active
+    return len(active)
 
 # =============================
-# DNS Monitor
+# DNS Monitor (with domain extraction)
 # =============================
 def dns_monitor():
+    global domain_counts
+
     try:
         cap = pcapy.open_live(INTERFACE, 65536, 1, 100)
         cap.setfilter("udp port 53")
-    except Exception as e:
-        print(f"DNS capture error: {e}")
+    except:
         return
 
     print("DNS monitor started...")
 
     while True:
         try:
-            header, packet = cap.next()
+            _, packet = cap.next()
             if not packet:
                 continue
 
@@ -235,17 +206,10 @@ def dns_monitor():
 
             ip_header_length = (iph[0] & 0xF) * 4
             udp_start = 14 + ip_header_length
-
-            udp_header = packet[udp_start:udp_start + 8]
-            if len(udp_header) < 8:
-                continue
-
-            udph = struct.unpack("!HHHH", udp_header)
-            if udph[0] != 53:
-                continue
+            udph = struct.unpack("!HHHH", packet[udp_start:udp_start+8])
 
             dns_start = udp_start + 8
-            dns_header = packet[dns_start:dns_start + 12]
+            dns_header = packet[dns_start:dns_start+12]
 
             if len(dns_header) < 12:
                 continue
@@ -256,30 +220,73 @@ def dns_monitor():
             qr = (flags >> 15) & 0x1
             rcode = flags & 0xF
 
+            # DNS response stats
             if qr == 1:
                 if rcode == 3:
                     dns_errors_total.inc()
                 elif rcode == 0:
                     dns_success_total.inc()
 
-        except Exception:
+            # Extract domain (only queries)
+            if qr == 0:
+                query_start = dns_start + 12
+                domain = []
+                i = query_start
+
+                while True:
+                    length = packet[i]
+                    if length == 0:
+                        break
+                    i += 1
+                    domain.append(packet[i:i+length].decode(errors='ignore'))
+                    i += length
+
+                domain_name = ".".join(domain)
+
+                now = time.time()
+                with lock:
+                    domain_counts[domain_name] += 1
+                    domain_timestamps.append((now, domain_name))
+
+        except:
             continue
+
+# =============================
+# Dynamic Target Updater
+# =============================
+def update_dynamic_targets():
+    global dynamic_targets
+
+    while True:
+        time.sleep(UPDATE_INTERVAL)
+        now = time.time()
+
+        with lock:
+            # Remove old entries
+            while domain_timestamps and now - domain_timestamps[0][0] > DOMAIN_WINDOW:
+                _, old_domain = domain_timestamps.popleft()
+                domain_counts[old_domain] -= 1
+                if domain_counts[old_domain] <= 0:
+                    del domain_counts[old_domain]
+
+            # Get top domains
+            top = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
+
+            dynamic_targets = [(d, 443) for d, _ in top if len(d) > 3]
+
+            print("Updated dynamic targets:", dynamic_targets)
 
 # =============================
 # Monitoring Threads
 # =============================
 def internet_monitor():
     while True:
-        status = check_internet()
-        internet_status.set(status)
-        print("Internet UP" if status else "Internet DOWN")
+        internet_status.set(check_internet())
         time.sleep(CHECK_INTERVAL)
 
 def lan_monitor():
     while True:
-        count = discover_lan_devices()
-        lan_devices_total.set(count)
-        print(f"Active devices: {count}")
+        lan_devices_total.set(discover_lan_devices())
         time.sleep(CHECK_INTERVAL)
 
 # =============================
@@ -287,12 +294,13 @@ def lan_monitor():
 # =============================
 if __name__ == "__main__":
     start_http_server(8000)
-    print("Exporter running on http://localhost:8000/metrics")
+    print("Exporter running on :8000")
 
     threading.Thread(target=internet_monitor, daemon=True).start()
     threading.Thread(target=lan_monitor, daemon=True).start()
     threading.Thread(target=dns_monitor, daemon=True).start()
-    threading.Thread(target=latency_monitor, daemon=True).start()  # ✅ NEW
+    threading.Thread(target=latency_monitor, daemon=True).start()
+    threading.Thread(target=update_dynamic_targets, daemon=True).start()
 
     while True:
         time.sleep(1)
