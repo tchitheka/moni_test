@@ -18,20 +18,11 @@ internet_rtt_seconds = Histogram(
     'internet_rtt_seconds',
     'RTT latency across multiple targets',
     buckets = [
-    0.05,
-    0.1,
-    0.15,
-    0.2,
-    0.25,
-    0.3,
-    0.35,
-    0.4,
-    0.45,
-    0.5,
-    0.75,
-    1.0,
-    2.0
-]
+        0.05,0.1,0.15,0.2,0.25,
+    0.3,0.35,0.4,0.45,0.5,
+    0.75,1.0,2.0,
+    3.0, 5.0, 10.0 
+    ]
 )
 
 rtt_failures_total = Counter('rtt_failures_total','Total RTT failures')
@@ -42,6 +33,10 @@ device_flaps_total = Counter('device_flaps_total','Device flap events')
 dns_errors_total = Counter('dns_errors_total','DNS NXDOMAIN errors')
 dns_success_total = Counter('dns_success_total','DNS successful responses')
 
+# ✅ NEW: Throughput metrics
+network_rx_bps = Gauge('network_rx_bps', 'Receive throughput (bits per second)', ['interface'])
+network_tx_bps = Gauge('network_tx_bps', 'Transmit throughput (bits per second)', ['interface'])
+
 # =============================
 # Config
 # =============================
@@ -51,15 +46,10 @@ DEVICE_TIMEOUT = 60
 FLAP_WINDOW = 120
 INTERFACE = "wlp0s20f3"
 
-# ✅ Static baseline targets (always included)
-STATIC_TARGETS = [
-    ("8.8.8.8", 53),
-    ("1.1.1.1", 53),
-]
+STATIC_TARGETS = [("8.8.8.8", 53), ("1.1.1.1", 53)]
 
-# Dynamic config
 TOP_N = 5
-DOMAIN_WINDOW = 300  # 5 minutes
+DOMAIN_WINDOW = 300
 UPDATE_INTERVAL = 300
 
 # =============================
@@ -68,12 +58,55 @@ UPDATE_INTERVAL = 300
 device_last_seen = {}
 device_last_disappeared = {}
 
-# DNS tracking
 domain_counts = defaultdict(int)
 domain_timestamps = deque()
 dynamic_targets = []
 
+# ✅ NEW: throughput state
+throughput_prev = {}
+
 lock = threading.Lock()
+
+# =============================
+# THROUGHPUT FUNCTION
+# =============================
+def get_bytes(interface):
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                if line.strip().startswith(interface + ":"):
+                    data = line.split()
+                    return int(data[1]), int(data[9])  # RX, TX
+    except:
+        pass
+    return None, None
+
+def throughput_monitor():
+    global throughput_prev
+
+    # Initialize
+    rx, tx = get_bytes(INTERFACE)
+    if rx is None:
+        return
+
+    throughput_prev[INTERFACE] = (rx, tx)
+
+    while True:
+        time.sleep(CHECK_INTERVAL)
+
+        rx1, tx1 = throughput_prev[INTERFACE]
+        rx2, tx2 = get_bytes(INTERFACE)
+
+        if rx2 is None:
+            continue
+
+        rx_rate = (rx2 - rx1) * 8 / CHECK_INTERVAL
+        tx_rate = (tx2 - tx1) * 8 / CHECK_INTERVAL
+
+        network_rx_bps.labels(interface=INTERFACE).set(rx_rate)
+        network_tx_bps.labels(interface=INTERFACE).set(tx_rate)
+
+        throughput_prev[INTERFACE] = (rx2, tx2)
 
 # =============================
 # RTT Functions
@@ -137,7 +170,7 @@ def discover_lan_devices():
     global device_last_seen, device_last_disappeared
 
     try:
-        cap = pcapy.open_live(INTERFACE, 65536, 1, 100)
+        cap = pcapy.open_live(INTERFACE, 96, 1, 100)
         cap.setfilter("arp")
     except:
         return 0
@@ -177,18 +210,16 @@ def discover_lan_devices():
     return len(active)
 
 # =============================
-# DNS Monitor (with domain extraction)
+# DNS Monitor
 # =============================
 def dns_monitor():
     global domain_counts
 
     try:
-        cap = pcapy.open_live(INTERFACE, 65536, 1, 100)
+        cap = pcapy.open_live(INTERFACE, 96, 1, 100)
         cap.setfilter("udp port 53")
     except:
         return
-
-    print("DNS monitor started...")
 
     while True:
         try:
@@ -220,14 +251,12 @@ def dns_monitor():
             qr = (flags >> 15) & 0x1
             rcode = flags & 0xF
 
-            # DNS response stats
             if qr == 1:
                 if rcode == 3:
                     dns_errors_total.inc()
                 elif rcode == 0:
                     dns_success_total.inc()
 
-            # Extract domain (only queries)
             if qr == 0:
                 query_start = dns_start + 12
                 domain = []
@@ -252,7 +281,7 @@ def dns_monitor():
             continue
 
 # =============================
-# Dynamic Target Updater
+# Dynamic Targets
 # =============================
 def update_dynamic_targets():
     global dynamic_targets
@@ -262,19 +291,14 @@ def update_dynamic_targets():
         now = time.time()
 
         with lock:
-            # Remove old entries
             while domain_timestamps and now - domain_timestamps[0][0] > DOMAIN_WINDOW:
                 _, old_domain = domain_timestamps.popleft()
                 domain_counts[old_domain] -= 1
                 if domain_counts[old_domain] <= 0:
                     del domain_counts[old_domain]
 
-            # Get top domains
             top = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
-
             dynamic_targets = [(d, 443) for d, _ in top if len(d) > 3]
-
-            print("Updated dynamic targets:", dynamic_targets)
 
 # =============================
 # Monitoring Threads
@@ -301,6 +325,9 @@ if __name__ == "__main__":
     threading.Thread(target=dns_monitor, daemon=True).start()
     threading.Thread(target=latency_monitor, daemon=True).start()
     threading.Thread(target=update_dynamic_targets, daemon=True).start()
+
+    # ✅ NEW THREAD
+    threading.Thread(target=throughput_monitor, daemon=True).start()
 
     while True:
         time.sleep(1)
