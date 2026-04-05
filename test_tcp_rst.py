@@ -10,7 +10,7 @@ from prometheus_client import start_http_server, Counter
 # =============================
 # CONFIG
 # =============================
-INTERFACE = "wlp0s20f3"   # change if needed
+INTERFACE = "enp1s0"   # change if needed
 SNAPLEN = 128             # increased for safer parsing
 PROM_PORT = 8001
 
