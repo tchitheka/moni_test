@@ -29,6 +29,20 @@ rtt_failures_total = Counter('rtt_failures_total', 'Total RTT failures')
 lan_devices_total = Gauge('lan_devices_total', 'Active LAN devices')
 device_flaps_total = Counter('device_flaps_total', 'Device flap events')
 
+# Per-device flap counter (MAC + IP)
+device_flaps_by_mac_total = Counter(
+    'device_flaps_by_mac_total',
+    'Flap events per LAN device',
+    ['mac', 'ip']
+)
+
+# Per-device visibility
+device_seen_by_mac = Gauge(
+    'device_seen_by_mac',
+    'Whether a LAN device is currently active (1=active, 0=inactive)',
+    ['mac', 'ip']
+)
+
 dns_errors_total = Counter('dns_errors_total', 'DNS NXDOMAIN errors')
 dns_success_total = Counter('dns_success_total', 'DNS successful responses')
 
@@ -117,20 +131,25 @@ icmp_parameter_problem_total = Counter(
     "ICMP parameter problem messages observed"
 )
 
-# --- Per-host visibility ---
-host_icmp_packets = Gauge(
-    "host_icmp_packets",
-    "Observed ICMP packet count per source host",
+# =============================
+# UPDATED PER-HOST METRICS
+# =============================
+
+host_icmp_packets_total = Counter(
+    "host_icmp_packets_total",
+    "Total ICMP packets observed per source host",
     ["src_ip"]
 )
 
-host_icmp_faults = Gauge(
-    "host_icmp_faults",
-    "Observed ICMP fault count per source host",
+host_icmp_faults_total = Counter(
+    "host_icmp_faults_total",
+    "Total ICMP fault events observed per source host",
     ["src_ip"]
 )
 
-# --- Dashboard summary gauges ---
+# =============================
+# Dashboard summary gauges
+# =============================
 network_health_score = Gauge(
     "network_health_score",
     "Simple ICMP-based network health score (0-100)"
@@ -138,16 +157,16 @@ network_health_score = Gauge(
 
 active_fault_hosts = Gauge(
     "active_fault_hosts",
-    "Number of hosts currently associated with observed ICMP faults"
+    "Number of source hosts that have ever been associated with observed ICMP faults since exporter start"
 )
 
 # =============================
 # Config
 # =============================
-CHECK_INTERVAL = 10
-ARP_CAPTURE_DURATION = 10
-DEVICE_TIMEOUT = 60
-FLAP_WINDOW = 120
+CHECK_INTERVAL = 5
+ARP_CAPTURE_DURATION = 5
+DEVICE_TIMEOUT = 12
+FLAP_WINDOW = 60
 
 # enp1s0 / wlp0s20f3
 INTERFACE = "enp1s0"
@@ -161,8 +180,14 @@ UPDATE_INTERVAL = 300
 # =============================
 # Global State
 # =============================
-device_last_seen = {}
-device_last_disappeared = {}
+
+# MAC -> {
+#   "last_seen": ts,
+#   "ip": "...",
+#   "online": True/False,
+#   "last_offline": ts_or_None
+# }
+device_state = {}
 
 domain_counts = defaultdict(int)
 domain_timestamps = deque()
@@ -170,11 +195,11 @@ dynamic_targets = []
 
 throughput_prev = {}
 
-# ICMP state
+# ICMP state (used only for exporter-side summaries)
 traffic_counter = defaultdict(int)
 fault_counter = defaultdict(int)
 
-# ICMP health score state (avoid using metric._value.get())
+# ICMP health score state
 icmp_fault_totals = {
     "network_unreachable": 0,
     "host_unreachable": 0,
@@ -287,15 +312,24 @@ def check_internet():
         return 0
 
 # =============================
-# ARP Monitoring
+# ARP Monitoring (FIXED FLAP LOGIC)
 # =============================
 def discover_lan_devices():
-    global device_last_seen, device_last_disappeared
+    """
+    Discover active LAN devices from ARP traffic.
+    Tracks:
+      - MAC
+      - IP
+      - flap events
+      - currently active devices
+    """
+    global device_state
 
     try:
         cap = pcapy.open_live(INTERFACE, 96, 1, 100)
         cap.setfilter("arp")
-    except:
+    except Exception as e:
+        print(f"ARP monitor failed to start: {e}")
         return 0
 
     start_time = time.time()
@@ -307,30 +341,67 @@ def discover_lan_devices():
                 continue
 
             arp = struct.unpack("!HHBBH6s4s6s4s", packet[14:42])
-            mac = ':'.join('%02x' % b for b in arp[5])
+
+            sender_mac = ':'.join('%02x' % b for b in arp[5])
+            sender_ip = socket.inet_ntoa(arp[6])
+
+            # Ignore invalid / bootstrapping IPs
+            if sender_ip == "0.0.0.0":
+                continue
+
             now = time.time()
 
-            if mac in device_last_disappeared:
-                if now - device_last_disappeared[mac] <= FLAP_WINDOW:
-                    device_flaps_total.inc()
-                del device_last_disappeared[mac]
+            if sender_mac not in device_state:
+                # First time ever seeing this device
+                device_state[sender_mac] = {
+                    "last_seen": now,
+                    "ip": sender_ip,
+                    "online": True,
+                    "last_offline": None
+                }
+            else:
+                # If it was offline and now seen again => flap
+                if device_state[sender_mac]["online"] is False:
+                    last_offline = device_state[sender_mac]["last_offline"]
 
-            device_last_seen[mac] = now
+                    if last_offline and (now - last_offline <= FLAP_WINDOW):
+                        print(f"[FLAP] {sender_mac} ({sender_ip}) came back online")
+                        device_flaps_total.inc()
+                        device_flaps_by_mac_total.labels(
+                            mac=sender_mac,
+                            ip=sender_ip
+                        ).inc()
 
-        except:
+                # Mark it back online
+                device_state[sender_mac]["online"] = True
+                device_state[sender_mac]["last_offline"] = None
+                device_state[sender_mac]["last_seen"] = now
+                device_state[sender_mac]["ip"] = sender_ip
+
+        except Exception:
             continue
 
     now = time.time()
-    active = {}
+    active_count = 0
 
-    for mac, ts in device_last_seen.items():
-        if now - ts <= DEVICE_TIMEOUT:
-            active[mac] = ts
+    for mac, info in device_state.items():
+        ip = info.get("ip", "unknown")
+
+        if now - info["last_seen"] > DEVICE_TIMEOUT:
+            # Mark offline only once
+            if info["online"] is True:
+                info["online"] = False
+                info["last_offline"] = now
+                print(f"[OFFLINE] {mac} ({ip}) marked offline")
+
+            device_seen_by_mac.labels(mac=mac, ip=ip).set(0)
+
         else:
-            device_last_disappeared[mac] = now
+            info["online"] = True
+            device_seen_by_mac.labels(mac=mac, ip=ip).set(1)
+            active_count += 1
 
-    device_last_seen = active
-    return len(active)
+    return active_count
 
 # =============================
 # DNS Monitor
@@ -486,7 +557,7 @@ def ip_to_str(raw):
 
 def inc_fault(src_ip):
     fault_counter[src_ip] += 1
-    host_icmp_faults.labels(src_ip=src_ip).set(fault_counter[src_ip])
+    host_icmp_faults_total.labels(src_ip=src_ip).inc()
 
 def update_health():
     """
@@ -602,9 +673,9 @@ def parse_ipv4_for_icmp(data):
     if proto != 1:
         return
 
-    # Track per-host ICMP traffic ONLY for ICMP
+    # Track per-host ICMP traffic as a COUNTER
     traffic_counter[src_ip] += 1
-    host_icmp_packets.labels(src_ip=src_ip).set(traffic_counter[src_ip])
+    host_icmp_packets_total.labels(src_ip=src_ip).inc()
 
     ip_payload = data[14 + ihl:]
     parse_icmp(ip_payload, src_ip, dst_ip)
