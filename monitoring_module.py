@@ -43,8 +43,37 @@ device_seen_by_mac = Gauge(
     ['mac', 'ip']
 )
 
+# Per-device last flap timestamp
+device_last_flap_timestamp_seconds = Gauge(
+    'device_last_flap_timestamp_seconds',
+    'Last flap timestamp per LAN device',
+    ['mac', 'ip']
+)
+
+# =============================
+# DNS METRICS
+# =============================
 dns_errors_total = Counter('dns_errors_total', 'DNS NXDOMAIN errors')
 dns_success_total = Counter('dns_success_total', 'DNS successful responses')
+
+# Drill-down DNS metrics
+dns_queries_by_domain_total = Counter(
+    'dns_queries_by_domain_total',
+    'DNS queries observed per domain',
+    ['domain']
+)
+
+dns_nxdomain_by_domain_total = Counter(
+    'dns_nxdomain_by_domain_total',
+    'DNS NXDOMAIN responses observed per domain',
+    ['domain']
+)
+
+dns_success_by_domain_total = Counter(
+    'dns_success_by_domain_total',
+    'DNS successful responses observed per domain',
+    ['domain']
+)
 
 # =============================
 # Passive TCP metrics
@@ -134,7 +163,6 @@ icmp_parameter_problem_total = Counter(
 # =============================
 # UPDATED PER-HOST METRICS
 # =============================
-
 host_icmp_packets_total = Counter(
     "host_icmp_packets_total",
     "Total ICMP packets observed per source host",
@@ -143,8 +171,8 @@ host_icmp_packets_total = Counter(
 
 host_icmp_faults_total = Counter(
     "host_icmp_faults_total",
-    "Total ICMP fault events observed per source host",
-    ["src_ip"]
+    "Total ICMP fault events observed per source and destination",
+    ["src_ip", "dst_ip", "fault_type"]  
 )
 
 # =============================
@@ -315,14 +343,6 @@ def check_internet():
 # ARP Monitoring (FIXED FLAP LOGIC)
 # =============================
 def discover_lan_devices():
-    """
-    Discover active LAN devices from ARP traffic.
-    Tracks:
-      - MAC
-      - IP
-      - flap events
-      - currently active devices
-    """
     global device_state
 
     try:
@@ -345,14 +365,12 @@ def discover_lan_devices():
             sender_mac = ':'.join('%02x' % b for b in arp[5])
             sender_ip = socket.inet_ntoa(arp[6])
 
-            # Ignore invalid / bootstrapping IPs
             if sender_ip == "0.0.0.0":
                 continue
 
             now = time.time()
 
             if sender_mac not in device_state:
-                # First time ever seeing this device
                 device_state[sender_mac] = {
                     "last_seen": now,
                     "ip": sender_ip,
@@ -360,19 +378,30 @@ def discover_lan_devices():
                     "last_offline": None
                 }
             else:
-                # If it was offline and now seen again => flap
                 if device_state[sender_mac]["online"] is False:
                     last_offline = device_state[sender_mac]["last_offline"]
 
+
+
                     if last_offline and (now - last_offline <= FLAP_WINDOW):
                         print(f"[FLAP] {sender_mac} ({sender_ip}) came back online")
+
                         device_flaps_total.inc()
+
                         device_flaps_by_mac_total.labels(
                             mac=sender_mac,
                             ip=sender_ip
                         ).inc()
 
-                # Mark it back online
+                        # ✅ NEW: store last flap time
+                        device_last_flap_timestamp_seconds.labels(
+                            mac=sender_mac,
+                            ip=sender_ip
+                        ).set(now)
+
+
+
+                    
                 device_state[sender_mac]["online"] = True
                 device_state[sender_mac]["last_offline"] = None
                 device_state[sender_mac]["last_seen"] = now
@@ -388,7 +417,6 @@ def discover_lan_devices():
         ip = info.get("ip", "unknown")
 
         if now - info["last_seen"] > DEVICE_TIMEOUT:
-            # Mark offline only once
             if info["online"] is True:
                 info["online"] = False
                 info["last_offline"] = now
@@ -404,82 +432,187 @@ def discover_lan_devices():
     return active_count
 
 # =============================
-# DNS Monitor
+# DNS HELPERS (FIXED)
+# =============================
+def parse_dns_name(payload, offset):
+    labels = []
+    jumped = False
+    original_offset = offset
+    max_jumps = 10
+    jumps = 0
+
+    while offset < len(payload):
+        if jumps > max_jumps:
+            break
+
+        length = payload[offset]
+
+        if length == 0:
+            offset += 1
+            break
+
+        # compression pointer
+        if (length & 0xC0) == 0xC0:
+            if offset + 1 >= len(payload):
+                break
+            pointer = ((length & 0x3F) << 8) | payload[offset + 1]
+            if pointer >= len(payload):
+                break
+            if not jumped:
+                original_offset = offset + 2
+            offset = pointer
+            jumped = True
+            jumps += 1
+            continue
+
+        offset += 1
+        if offset + length > len(payload):
+            break
+
+        label = payload[offset:offset + length].decode(errors='ignore')
+        labels.append(label)
+        offset += length
+
+    domain = ".".join(labels)
+    return domain, (original_offset if jumped else offset)
+
+def parse_dns_payload(dns_payload):
+    if len(dns_payload) < 12:
+        return None, None, None
+
+    try:
+        dns = struct.unpack("!HHHHHH", dns_payload[:12])
+        flags = dns[1]
+        qdcount = dns[2]
+
+        qr = (flags >> 15) & 0x1
+        rcode = flags & 0xF
+
+        domain_name = None
+        offset = 12
+
+        if qdcount > 0:
+            domain_name, offset = parse_dns_name(dns_payload, offset)
+
+        return qr, rcode, domain_name
+    except:
+        return None, None, None
+
+# =============================
+# DNS Monitor (FIXED)
 # =============================
 def dns_monitor():
     global domain_counts
 
     try:
-        cap = pcapy.open_live(INTERFACE, 96, 1, 100)
-        cap.setfilter("udp port 53")
-    except:
+        cap = pcapy.open_live(INTERFACE, 65535, 1, 100)
+        cap.setfilter("port 53")
+    except Exception as e:
+        print(f"DNS monitor failed to start: {e}")
         return
+
+    print("DNS monitor started...")
 
     while True:
         try:
             _, packet = cap.next()
-            if not packet:
+            if not packet or len(packet) < 34:
                 continue
 
-            if len(packet) < 34:
+            eth_type = struct.unpack("!H", packet[12:14])[0]
+            if eth_type != 0x0800:  # IPv4 only
                 continue
 
-            ip_header = packet[14:34]
-            if len(ip_header) < 20:
+            ip_start = 14
+            if len(packet) < ip_start + 20:
                 continue
 
+            ip_header = packet[ip_start:ip_start + 20]
             iph = struct.unpack("!BBHHHBBH4s4s", ip_header)
-            if iph[6] != 17:
+            protocol = iph[6]
+            ihl = (iph[0] & 0x0F) * 4
+
+            if len(packet) < ip_start + ihl:
                 continue
 
-            ip_header_length = (iph[0] & 0xF) * 4
-            udp_start = 14 + ip_header_length
+            transport_start = ip_start + ihl
 
-            if len(packet) < udp_start + 8:
+            dns_payload = None
+
+            # UDP DNS
+            if protocol == 17:
+                if len(packet) < transport_start + 8:
+                    continue
+
+                udp_header = packet[transport_start:transport_start + 8]
+                src_port, dst_port, udp_len, udp_checksum = struct.unpack("!HHHH", udp_header)
+
+                if src_port != 53 and dst_port != 53:
+                    continue
+
+                dns_payload = packet[transport_start + 8:]
+
+            # TCP DNS
+            elif protocol == 6:
+                if len(packet) < transport_start + 20:
+                    continue
+
+                tcp_header = packet[transport_start:transport_start + 20]
+                tcph = struct.unpack("!HHLLBBHHH", tcp_header)
+                src_port = tcph[0]
+                dst_port = tcph[1]
+                tcp_header_len = ((tcph[4] >> 4) & 0xF) * 4
+
+                if src_port != 53 and dst_port != 53:
+                    continue
+
+                if len(packet) < transport_start + tcp_header_len + 2:
+                    continue
+
+                tcp_payload = packet[transport_start + tcp_header_len:]
+
+                if len(tcp_payload) < 2:
+                    continue
+
+                # TCP DNS has 2-byte length prefix
+                dns_length = struct.unpack("!H", tcp_payload[:2])[0]
+                if len(tcp_payload) < 2 + dns_length:
+                    continue
+
+                dns_payload = tcp_payload[2:2 + dns_length]
+
+            else:
                 continue
 
-            dns_start = udp_start + 8
-            dns_header = packet[dns_start:dns_start+12]
-
-            if len(dns_header) < 12:
+            if not dns_payload:
                 continue
 
-            dns = struct.unpack("!HHHHHH", dns_header)
-            flags = dns[1]
+            qr, rcode, domain_name = parse_dns_payload(dns_payload)
 
-            qr = (flags >> 15) & 0x1
-            rcode = flags & 0xF
+            if qr is None:
+                continue
 
             if qr == 1:
                 if rcode == 3:
                     dns_errors_total.inc()
+                    if domain_name:
+                        dns_nxdomain_by_domain_total.labels(domain=domain_name).inc()
+
                 elif rcode == 0:
                     dns_success_total.inc()
+                    if domain_name:
+                        dns_success_by_domain_total.labels(domain=domain_name).inc()
 
-            if qr == 0:
-                query_start = dns_start + 12
-                domain = []
-                i = query_start
-
-                while i < len(packet):
-                    length = packet[i]
-                    if length == 0:
-                        break
-                    i += 1
-                    if i + length > len(packet):
-                        break
-                    domain.append(packet[i:i+length].decode(errors='ignore'))
-                    i += length
-
-                domain_name = ".".join(domain)
-
+            elif qr == 0:
                 if domain_name:
+                    dns_queries_by_domain_total.labels(domain=domain_name).inc()
+
                     now = time.time()
                     with lock:
                         domain_counts[domain_name] += 1
                         domain_timestamps.append((now, domain_name))
 
-        except:
+        except Exception:
             continue
 
 # =============================
@@ -502,17 +635,13 @@ def tcp_monitor():
                 continue
 
             eth_length = 14
-
-            # Ethernet
             eth_header = packet[:eth_length]
             eth = struct.unpack("!6s6sH", eth_header)
             eth_protocol = socket.ntohs(eth[2])
 
-            # IPv4 only
             if eth_protocol != 8:
                 continue
 
-            # IP header
             ip_header = packet[eth_length:eth_length+20]
             if len(ip_header) < 20:
                 continue
@@ -538,11 +667,9 @@ def tcp_monitor():
             ack = flags & 0x10
             rst = flags & 0x04
 
-            # Initial SYN only
             if syn and not ack:
                 tcp_syn_total.inc()
 
-            # Any RST packet
             if rst:
                 tcp_rst_errors_total.inc()
 
@@ -555,14 +682,15 @@ def tcp_monitor():
 def ip_to_str(raw):
     return socket.inet_ntoa(raw)
 
-def inc_fault(src_ip):
+def inc_fault(src_ip, dst_ip, fault_type):
     fault_counter[src_ip] += 1
-    host_icmp_faults_total.labels(src_ip=src_ip).inc()
+    host_icmp_faults_total.labels(
+        src_ip=src_ip,
+        dst_ip=dst_ip,
+        fault_type=fault_type
+    ).inc()
 
 def update_health():
-    """
-    Lightweight ICMP-based health score (0-100).
-    """
     score = 100
 
     score -= min(15, icmp_fault_totals["network_unreachable"] * 2)
@@ -586,20 +714,24 @@ def health_updater():
         time.sleep(2)
 
 # =============================
-# ICMP PARSER
+# ICMP PARSER (FIXED)
 # =============================
 def parse_icmp(ip_payload, src_ip, dst_ip):
-    icmp_packets_total.inc()
-
     if len(ip_payload) < 8:
         return
 
-    icmp_type, icmp_code, _ = struct.unpack("!BBH", ip_payload[:4])
+    icmp_packets_total.inc()
 
-    # Successful ICMP traffic
+    try:
+        icmp_type, icmp_code, checksum = struct.unpack("!BBH", ip_payload[:4])
+    except:
+        return
+
+    # Echo Request
     if icmp_type == 8 and icmp_code == 0:
         icmp_echo_request_total.inc()
 
+    # Echo Reply
     elif icmp_type == 0 and icmp_code == 0:
         icmp_echo_reply_total.inc()
 
@@ -608,84 +740,94 @@ def parse_icmp(ip_payload, src_ip, dst_ip):
         if icmp_code == 0:
             icmp_network_unreachable_total.inc()
             icmp_fault_totals["network_unreachable"] += 1
-            inc_fault(src_ip)
+            inc_fault(src_ip, dst_ip, "network_unreachable")
 
         elif icmp_code == 1:
             icmp_host_unreachable_total.inc()
             icmp_fault_totals["host_unreachable"] += 1
-            inc_fault(src_ip)
+            inc_fault(src_ip, dst_ip, "host_unreachable")
 
         elif icmp_code == 2:
             icmp_protocol_unreachable_total.inc()
             icmp_fault_totals["protocol_unreachable"] += 1
-            inc_fault(src_ip)
+            inc_fault(src_ip, dst_ip, "protocol_unreachable")
 
         elif icmp_code == 3:
             icmp_port_unreachable_total.inc()
             icmp_fault_totals["port_unreachable"] += 1
-            inc_fault(src_ip)
+            inc_fault(src_ip, dst_ip, "port_unreachable")
 
         elif icmp_code == 4:
             icmp_fragmentation_needed_total.inc()
             icmp_fault_totals["fragmentation_needed"] += 1
-            inc_fault(src_ip)
+            inc_fault(src_ip, dst_ip, "fragmentation_needed")
 
         elif icmp_code == 5:
             icmp_source_route_failed_total.inc()
             icmp_fault_totals["source_route_failed"] += 1
-            inc_fault(src_ip)
+            inc_fault(src_ip, dst_ip, "source_route_failed")
 
     # Redirect
     elif icmp_type == 5:
         icmp_redirect_total.inc()
         icmp_fault_totals["redirect"] += 1
-        inc_fault(src_ip)
+        inc_fault(src_ip, dst_ip, "redirect")
 
     # TTL exceeded
-    elif icmp_type == 11 and icmp_code == 0:
+    elif icmp_type == 11:
         icmp_ttl_exceeded_total.inc()
         icmp_fault_totals["ttl_exceeded"] += 1
-        inc_fault(src_ip)
+        inc_fault(src_ip, dst_ip, "ttl_exceeded")
 
     # Parameter problem
     elif icmp_type == 12:
         icmp_parameter_problem_total.inc()
         icmp_fault_totals["parameter_problem"] += 1
-        inc_fault(src_ip)
+        inc_fault(src_ip, dst_ip, "parameter_problem")
 
 # =============================
-# IPv4 PARSER (ICMP only)
+# IPv4 PARSER (ICMP only) - FIXED
 # =============================
-def parse_ipv4_for_icmp(data):
-    if len(data) < 34:
+def parse_ipv4_for_icmp(packet):
+    if len(packet) < 34:
         return
 
-    ip_header = data[14:34]
+    ip_start = 14
+
+    if len(packet) < ip_start + 20:
+        return
+
+    ip_header = packet[ip_start:ip_start + 20]
 
     version_ihl = ip_header[0]
+    version = version_ihl >> 4
     ihl = (version_ihl & 0x0F) * 4
+
+    if version != 4 or ihl < 20:
+        return
+
+    if len(packet) < ip_start + ihl:
+        return
+
     proto = ip_header[9]
 
     src_ip = ip_to_str(ip_header[12:16])
     dst_ip = ip_to_str(ip_header[16:20])
 
-    # Only ICMP
     if proto != 1:
         return
 
-    # Track per-host ICMP traffic as a COUNTER
-    traffic_counter[src_ip] += 1
     host_icmp_packets_total.labels(src_ip=src_ip).inc()
 
-    ip_payload = data[14 + ihl:]
+    ip_payload = packet[ip_start + ihl:]
     parse_icmp(ip_payload, src_ip, dst_ip)
 
 # =============================
-# PASSIVE ICMP Monitor
+# PASSIVE ICMP Monitor (FIXED)
 # =============================
 def icmp_monitor():
     try:
-        cap = pcapy.open_live(INTERFACE, 128, 1, 100)
+        cap = pcapy.open_live(INTERFACE, 65535, 1, 100)
         cap.setfilter("icmp")
     except Exception as e:
         print(f"ICMP monitor failed to start: {e}")
@@ -701,11 +843,11 @@ def icmp_monitor():
 
             eth_type = struct.unpack("!H", packet[12:14])[0]
 
-            with lock:
-                if eth_type == 0x0800:  # IPv4
+            if eth_type == 0x0800:  # IPv4
+                with lock:
                     parse_ipv4_for_icmp(packet)
 
-        except:
+        except Exception:
             continue
 
 # =============================
@@ -763,4 +905,4 @@ if __name__ == "__main__":
     threading.Thread(target=icmp_monitor, daemon=True).start()
 
     while True:
-        time.sleep(1)
+        time.sleep(1) 
