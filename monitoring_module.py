@@ -4,6 +4,7 @@ import threading
 import pcapy
 import struct
 import socket
+import ipaddress
 from collections import defaultdict, deque
 
 from prometheus_client import start_http_server, Gauge, Counter, Histogram
@@ -28,6 +29,13 @@ rtt_failures_total = Counter('rtt_failures_total', 'Total RTT failures')
 
 lan_devices_total = Gauge('lan_devices_total', 'Active LAN devices')
 device_flaps_total = Counter('device_flaps_total', 'Device flap events')
+
+#Device last seen
+device_last_seen_timestamp = Gauge(
+    'device_last_seen_timestamp',
+    'Last time a device was seen (epoch time)',
+    ['mac', 'ip']
+)
 
 # Per-device flap counter (MAC + IP)
 device_flaps_by_mac_total = Counter(
@@ -195,6 +203,8 @@ CHECK_INTERVAL = 5
 ARP_CAPTURE_DURATION = 5
 DEVICE_TIMEOUT = 12
 FLAP_WINDOW = 60
+CLEANUP_INTERVAL = 3600  # 1 hour
+DEVICE_STALE_TIMEOUT = 86400  # 24 hours
 
 # enp1s0 / wlp0s20f3
 INTERFACE = "enp1s0"
@@ -241,6 +251,43 @@ icmp_fault_totals = {
 }
 
 lock = threading.Lock()
+
+# =============================
+# Helper function to check if IP is private/local
+# =============================
+def is_private_ip(ip_str):
+    """Check if an IP address is private/local (RFC 1918, loopback, link-local)"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        
+        # Check for private IP ranges
+        if ip.is_private:
+            return True
+        
+        # Additional check for common local ranges not caught by is_private
+        if ip.is_loopback:
+            return True
+        
+        if ip.is_link_local:
+            return True
+        
+        # Check for specific private ranges (redundant but explicit)
+        private_ranges = [
+            '10.0.0.0/8',
+            '172.16.0.0/12',
+            '192.168.0.0/16',
+            '169.254.0.0/16',  # Link-local
+            '127.0.0.0/8',     # Loopback
+        ]
+        
+        for cidr in private_ranges:
+            if ip in ipaddress.ip_network(cidr):
+                return True
+                
+        return False
+    except:
+        # If we can't parse the IP, assume it's not private
+        return False
 
 # =============================
 # THROUGHPUT FUNCTION
@@ -340,19 +387,52 @@ def check_internet():
         return 0
 
 # =============================
-# ARP Monitoring (FIXED FLAP LOGIC)
+# Cleanup stale devices
+# =============================
+def cleanup_stale_devices():
+    """Remove device metrics that haven't been seen for a long time"""
+    while True:
+        time.sleep(CLEANUP_INTERVAL)
+        now = time.time()
+        
+        with lock:
+            stale_macs = []
+            for mac, info in device_state.items():
+                if now - info["last_seen"] > DEVICE_STALE_TIMEOUT:
+                    stale_macs.append(mac)
+            
+            for mac in stale_macs:
+                ip = device_state[mac].get("ip", "unknown")
+                print(f"[CLEANUP] Removing stale device {mac} ({ip}) - not seen for {DEVICE_STALE_TIMEOUT/3600:.0f} hours")
+                
+                try:
+                    # Remove from Prometheus metrics
+                    device_seen_by_mac.remove(mac=mac, ip=ip)
+                    device_last_seen_timestamp.remove(mac=mac, ip=ip)
+                    device_flaps_by_mac_total.remove(mac=mac, ip=ip)
+                    device_last_flap_timestamp_seconds.remove(mac=mac, ip=ip)
+                except Exception as e:
+                    print(f"Error removing metrics for {mac}: {e}")
+                
+                # Remove from state
+                del device_state[mac]
+
+# =============================
+# ARP & IP Monitoring (FIXED - Now captures both ARP and IP traffic with IP filtering)
 # =============================
 def discover_lan_devices():
     global device_state
-
+    
     try:
+        # Capture both ARP and IP packets to detect active communication
         cap = pcapy.open_live(INTERFACE, 96, 1, 100)
-        cap.setfilter("arp")
+        cap.setfilter("arp or ip")
     except Exception as e:
-        print(f"ARP monitor failed to start: {e}")
+        print(f"LAN monitor failed to start: {e}")
         return 0
 
     start_time = time.time()
+    devices_seen_this_cycle = set()  # Track devices seen in this cycle
 
     while time.time() - start_time < ARP_CAPTURE_DURATION:
         try:
@@ -360,14 +440,43 @@ def discover_lan_devices():
             if not packet or len(packet) < 42:
                 continue
 
-            arp = struct.unpack("!HHBBH6s4s6s4s", packet[14:42])
-
-            sender_mac = ':'.join('%02x' % b for b in arp[5])
-            sender_ip = socket.inet_ntoa(arp[6])
-
-            if sender_ip == "0.0.0.0":
+            eth_type = struct.unpack("!H", packet[12:14])[0]
+            
+            sender_mac = None
+            sender_ip = None
+            
+            # Handle ARP packets
+            if eth_type == 0x0806:  # ARP
+                arp = struct.unpack("!HHBBH6s4s6s4s", packet[14:42])
+                sender_mac = ':'.join('%02x' % b for b in arp[5])
+                sender_ip = socket.inet_ntoa(arp[6])
+                
+                # For ARP packets, only accept private IPs
+                if not is_private_ip(sender_ip):
+                    continue
+            
+            # Handle IP packets
+            elif eth_type == 0x0800:  # IPv4
+                # Extract source MAC from Ethernet header
+                eth_header = packet[:14]
+                eth = struct.unpack("!6s6sH", eth_header)
+                sender_mac = ':'.join('%02x' % b for b in eth[1])  # Source MAC
+                
+                # Extract source IP from IP header
+                ip_start = 14
+                if len(packet) >= ip_start + 20:
+                    ip_header = packet[ip_start:ip_start + 20]
+                    iph = struct.unpack("!BBHHHBBH4s4s", ip_header)
+                    sender_ip = socket.inet_ntoa(iph[8])  # Source IP
+                    
+                    # For IP packets, only accept private IPs
+                    if not is_private_ip(sender_ip):
+                        continue
+            
+            if not sender_mac or not sender_ip or sender_ip == "0.0.0.0":
                 continue
-
+                
+            devices_seen_this_cycle.add(sender_mac)
             now = time.time()
 
             if sender_mac not in device_state:
@@ -377,11 +486,13 @@ def discover_lan_devices():
                     "online": True,
                     "last_offline": None
                 }
+                print(f"[NEW DEVICE] {sender_mac} ({sender_ip}) discovered via {'ARP' if eth_type == 0x0806 else 'IP'} traffic")
+                
+                # Set the last seen timestamp for new device
+                device_last_seen_timestamp.labels(mac=sender_mac, ip=sender_ip).set(now)
             else:
                 if device_state[sender_mac]["online"] is False:
                     last_offline = device_state[sender_mac]["last_offline"]
-
-
 
                     if last_offline and (now - last_offline <= FLAP_WINDOW):
                         print(f"[FLAP] {sender_mac} ({sender_ip}) came back online")
@@ -393,19 +504,19 @@ def discover_lan_devices():
                             ip=sender_ip
                         ).inc()
 
-                        # ✅ NEW: store last flap time
+                        # Store last flap time
                         device_last_flap_timestamp_seconds.labels(
                             mac=sender_mac,
                             ip=sender_ip
                         ).set(now)
-
-
-
-                    
+                
                 device_state[sender_mac]["online"] = True
                 device_state[sender_mac]["last_offline"] = None
                 device_state[sender_mac]["last_seen"] = now
                 device_state[sender_mac]["ip"] = sender_ip
+                
+                # Update the last seen timestamp for existing device
+                device_last_seen_timestamp.labels(mac=sender_mac, ip=sender_ip).set(now)
 
         except Exception:
             continue
@@ -415,6 +526,11 @@ def discover_lan_devices():
 
     for mac, info in device_state.items():
         ip = info.get("ip", "unknown")
+        
+        # Double-check that stored IPs are private
+        if ip != "unknown" and not is_private_ip(ip):
+            # If somehow a public IP got stored, skip counting it
+            continue
 
         if now - info["last_seen"] > DEVICE_TIMEOUT:
             if info["online"] is True:
@@ -423,12 +539,14 @@ def discover_lan_devices():
                 print(f"[OFFLINE] {mac} ({ip}) marked offline")
 
             device_seen_by_mac.labels(mac=mac, ip=ip).set(0)
+            # Note: Don't clear device_last_seen_timestamp, keep the last known time
 
         else:
             info["online"] = True
             device_seen_by_mac.labels(mac=mac, ip=ip).set(1)
             active_count += 1
 
+    print(f"LAN devices discovered this cycle: {len(devices_seen_this_cycle)}, Active total: {active_count}")
     return active_count
 
 # =============================
@@ -897,6 +1015,7 @@ if __name__ == "__main__":
     threading.Thread(target=update_dynamic_targets, daemon=True).start()
     threading.Thread(target=throughput_monitor, daemon=True).start()
     threading.Thread(target=health_updater, daemon=True).start()
+    threading.Thread(target=cleanup_stale_devices, daemon=True).start()
 
     # Passive TCP monitor (RST + SYN)
     threading.Thread(target=tcp_monitor, daemon=True).start()
@@ -905,4 +1024,4 @@ if __name__ == "__main__":
     threading.Thread(target=icmp_monitor, daemon=True).start()
 
     while True:
-        time.sleep(1) 
+        time.sleep(1)
