@@ -58,6 +58,21 @@ device_last_flap_timestamp_seconds = Gauge(
     ['mac', 'ip']
 )
 
+
+device_rx_bps = Gauge(
+    "device_rx_bps",
+    "Per-device receive throughput (bits per second)",
+    ["ip"]
+)
+
+device_tx_bps = Gauge(
+    "device_tx_bps",
+    "Per-device transmit throughput (bits per second)",
+    ["ip"]
+)
+
+
+
 # =============================
 # DNS METRICS
 # =============================
@@ -223,8 +238,13 @@ UPDATE_INTERVAL = 300
 #   "last_seen": ts,
 #   "ip": "...",
 #   "online": True/False,
-#   "last_offline": ts_or_None
+#   "last_offline": ts_or_None,
+#   "known_ips": set()  # Track all IPs seen for this MAC
 # }
+
+device_traffic = defaultdict(lambda: {"rx": 0, "tx": 0})
+device_prev = {}
+
 device_state = {}
 
 domain_counts = defaultdict(int)
@@ -251,6 +271,88 @@ icmp_fault_totals = {
 }
 
 lock = threading.Lock()
+
+
+############################
+##Packet Parser (Layer 3) ##
+############################
+
+def parse_ipv4_for_throughput(packet):
+    if len(packet) < 34:
+        return
+
+    ip_start = 14
+
+    ip_header = packet[ip_start:ip_start + 20]
+    version_ihl = ip_header[0]
+    ihl = (version_ihl & 0x0F) * 4
+
+    if len(packet) < ip_start + ihl:
+        return
+
+    total_length = struct.unpack("!H", ip_header[2:4])[0]
+
+    src_ip = socket.inet_ntoa(ip_header[12:16])
+    dst_ip = socket.inet_ntoa(ip_header[16:20])
+
+    # TX = source sending
+    device_traffic[src_ip]["tx"] += total_length
+
+    # RX = destination receiving
+    device_traffic[dst_ip]["rx"] += total_length
+
+
+######################
+### Throughput Monitor#
+#######################
+def device_throughput_monitor():
+    global device_prev
+
+    try:
+        cap = pcapy.open_live(INTERFACE, 65535, 1, 100)
+        cap.setfilter("ip")
+    except Exception as e:
+        print(f"Device throughput monitor failed: {e}")
+        return
+
+    print("Per-device throughput monitor started...")
+
+    last_time = time.time()
+
+    while True:
+        try:
+            _, packet = cap.next()
+            if not packet:
+                continue
+
+            with lock:
+                parse_ipv4_for_throughput(packet)
+
+            now = time.time()
+
+            if now - last_time >= CHECK_INTERVAL:
+                with lock:
+                    for ip, stats in device_traffic.items():
+                        prev = device_prev.get(ip, {"rx": 0, "tx": 0})
+
+                        rx_rate = max(0, (stats["rx"] - prev["rx"]) * 8 / CHECK_INTERVAL)
+                        tx_rate = max(0, (stats["tx"] - prev["tx"]) * 8 / CHECK_INTERVAL)
+
+                        device_rx_bps.labels(ip=ip).set(rx_rate)
+                        device_tx_bps.labels(ip=ip).set(tx_rate)
+
+                        device_prev[ip] = stats.copy()
+
+                last_time = now
+
+        except Exception:
+            continue
+
+
+
+
+
+
 
 # =============================
 # Helper function to check if IP is private/local
@@ -405,20 +507,22 @@ def cleanup_stale_devices():
                 ip = device_state[mac].get("ip", "unknown")
                 print(f"[CLEANUP] Removing stale device {mac} ({ip}) - not seen for {DEVICE_STALE_TIMEOUT/3600:.0f} hours")
                 
-                try:
-                    # Remove from Prometheus metrics
-                    device_seen_by_mac.remove(mac=mac, ip=ip)
-                    device_last_seen_timestamp.remove(mac=mac, ip=ip)
-                    device_flaps_by_mac_total.remove(mac=mac, ip=ip)
-                    device_last_flap_timestamp_seconds.remove(mac=mac, ip=ip)
-                except Exception as e:
-                    print(f"Error removing metrics for {mac}: {e}")
+                # Remove all IPs associated with this MAC
+                known_ips = device_state[mac].get("known_ips", set())
+                for known_ip in known_ips:
+                    try:
+                        device_seen_by_mac.remove(mac=mac, ip=known_ip)
+                        device_last_seen_timestamp.remove(mac=mac, ip=known_ip)
+                        device_flaps_by_mac_total.remove(mac=mac, ip=known_ip)
+                        device_last_flap_timestamp_seconds.remove(mac=mac, ip=known_ip)
+                    except Exception as e:
+                        print(f"Error removing metrics for {mac} ({known_ip}): {e}")
                 
                 # Remove from state
                 del device_state[mac]
 
 # =============================
-# ARP & IP Monitoring (FIXED - Now captures both ARP and IP traffic with IP filtering)
+# ARP & IP Monitoring (FIXED - Now handles multiple IPs per MAC)
 # =============================
 def discover_lan_devices():
     global device_state
@@ -478,19 +582,47 @@ def discover_lan_devices():
                 
             devices_seen_this_cycle.add(sender_mac)
             now = time.time()
+            
+            # Debug logging
+            print(f"[DEBUG] Seen {sender_mac} at {sender_ip} via {'ARP' if eth_type == 0x0806 else 'IP'}")
 
             if sender_mac not in device_state:
+                # New device discovered
                 device_state[sender_mac] = {
                     "last_seen": now,
                     "ip": sender_ip,
                     "online": True,
-                    "last_offline": None
+                    "last_offline": None,
+                    "known_ips": {sender_ip}  # Track all IPs for this MAC
                 }
                 print(f"[NEW DEVICE] {sender_mac} ({sender_ip}) discovered via {'ARP' if eth_type == 0x0806 else 'IP'} traffic")
                 
                 # Set the last seen timestamp for new device
                 device_last_seen_timestamp.labels(mac=sender_mac, ip=sender_ip).set(now)
+                device_seen_by_mac.labels(mac=sender_mac, ip=sender_ip).set(1)
             else:
+                # Existing device - check if IP changed or is new
+                old_ip = device_state[sender_mac].get("ip")
+                known_ips = device_state[sender_mac].get("known_ips", set())
+                
+                # Add this IP to known_ips if not already there
+                if sender_ip not in known_ips:
+                    known_ips.add(sender_ip)
+                    device_state[sender_mac]["known_ips"] = known_ips
+                    print(f"[NEW IP] {sender_mac} now has additional IP: {sender_ip} (known: {known_ips})")
+                    
+                    # Create metrics for the new IP
+                    device_last_seen_timestamp.labels(mac=sender_mac, ip=sender_ip).set(now)
+                    device_seen_by_mac.labels(mac=sender_mac, ip=sender_ip).set(1)
+                
+                # ALWAYS update the last_seen timestamp for the current IP
+                device_last_seen_timestamp.labels(mac=sender_mac, ip=sender_ip).set(now)
+                
+                # Update the primary IP if this is the most recently seen
+                if now > device_state[sender_mac]["last_seen"]:
+                    device_state[sender_mac]["ip"] = sender_ip
+                
+                # Handle flap detection if device was offline
                 if device_state[sender_mac]["online"] is False:
                     last_offline = device_state[sender_mac]["last_offline"]
 
@@ -510,15 +642,15 @@ def discover_lan_devices():
                             ip=sender_ip
                         ).set(now)
                 
+                # Update device state
                 device_state[sender_mac]["online"] = True
                 device_state[sender_mac]["last_offline"] = None
                 device_state[sender_mac]["last_seen"] = now
-                device_state[sender_mac]["ip"] = sender_ip
                 
-                # Update the last seen timestamp for existing device
-                device_last_seen_timestamp.labels(mac=sender_mac, ip=sender_ip).set(now)
+                # Ensure the seen_by metric is set to 1 for this IP
+                device_seen_by_mac.labels(mac=sender_mac, ip=sender_ip).set(1)
 
-        except Exception:
+        except Exception as e:
             continue
 
     now = time.time()
@@ -526,6 +658,7 @@ def discover_lan_devices():
 
     for mac, info in device_state.items():
         ip = info.get("ip", "unknown")
+        known_ips = info.get("known_ips", {ip})
         
         # Double-check that stored IPs are private
         if ip != "unknown" and not is_private_ip(ip):
@@ -538,11 +671,14 @@ def discover_lan_devices():
                 info["last_offline"] = now
                 print(f"[OFFLINE] {mac} ({ip}) marked offline")
 
-            device_seen_by_mac.labels(mac=mac, ip=ip).set(0)
+            # Mark all known IPs for this MAC as offline
+            for known_ip in known_ips:
+                device_seen_by_mac.labels(mac=mac, ip=known_ip).set(0)
             # Note: Don't clear device_last_seen_timestamp, keep the last known time
 
         else:
             info["online"] = True
+            # Mark the primary IP as active
             device_seen_by_mac.labels(mac=mac, ip=ip).set(1)
             active_count += 1
 
@@ -1016,6 +1152,7 @@ if __name__ == "__main__":
     threading.Thread(target=throughput_monitor, daemon=True).start()
     threading.Thread(target=health_updater, daemon=True).start()
     threading.Thread(target=cleanup_stale_devices, daemon=True).start()
+    threading.Thread(target=device_throughput_monitor, daemon=True).start()
 
     # Passive TCP monitor (RST + SYN)
     threading.Thread(target=tcp_monitor, daemon=True).start()
